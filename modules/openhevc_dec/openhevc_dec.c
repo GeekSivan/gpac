@@ -65,6 +65,8 @@ typedef struct
 	Bool conv_to_8bit;
 	char *conv_buffer;
 
+	u32 frame_idx;
+	Bool pack_mode;
 } HEVCDec;
 
 static GF_Err HEVC_ConfigurationScalableStream(HEVCDec *ctx, GF_ESD *esd)
@@ -99,6 +101,7 @@ static GF_Err HEVC_ConfigurationScalableStream(HEVCDec *ctx, GF_ESD *esd)
 
 	libOpenHevcSetActiveDecoders(ctx->openHevcHandle, 2);
 	libOpenHevcSetViewLayers(ctx->openHevcHandle, 1);
+
 	return GF_OK;
 }
 
@@ -181,7 +184,9 @@ static GF_Err HEVC_ConfigureStream(HEVCDec *ctx, GF_ESD *esd)
 		ctx->out_size /= 2;
 		ctx->chroma_bpp = ctx->luma_bpp = 8;
 		ctx->conv_to_8bit = 1;
+		ctx->pack_mode = 0;
 	}
+
 	return GF_OK;
 }
 
@@ -226,6 +231,9 @@ static GF_Err HEVC_AttachStream(GF_BaseDecoder *ifcg, GF_ESD *esd)
 	if (sOpt) ctx->output_cb_size = atoi(sOpt);
 	if (!ctx->output_cb_size) ctx->output_cb_size = 4;
 
+	sOpt = gf_modules_get_option((GF_BaseInterface *)ifcg, "OpenHEVC", "PackHFR");
+	if (sOpt && !strcmp(sOpt, "yes") ) ctx->pack_mode = 1;
+	else if (!sOpt) gf_modules_set_option((GF_BaseInterface *)ifcg, "OpenHEVC", "PackHFR", "no");
 
 
 	/*RTP case: configure enhancement now*/
@@ -264,18 +272,21 @@ static GF_Err HEVC_GetCapabilities(GF_BaseDecoder *ifcg, GF_CodecCapability *cap
 		break;
 	case GF_CODEC_WIDTH:
 		capability->cap.valueInt = ctx->width;
+		if (ctx->pack_mode) {
+			capability->cap.valueInt *= 2;
+		}
 		break;
 	case GF_CODEC_HEIGHT:
 		capability->cap.valueInt = ctx->height;
+		if (ctx->pack_mode) {
+			capability->cap.valueInt *= 2;
+		}
 		break;
 	case GF_CODEC_STRIDE:
 		capability->cap.valueInt = ctx->stride;
-		if (ctx->direct_output && !ctx->conv_buffer) {
-			//to fix soon - currently hardcoded to 32 pixels
-			if ((ctx->luma_bpp==8) && (ctx->chroma_bpp==8))
-				capability->cap.valueInt += 32;
-			else
-				capability->cap.valueInt += 64;
+
+		if (ctx->pack_mode) {
+			capability->cap.valueInt *= 2;
 		}
 		break;
 	case GF_CODEC_PAR:
@@ -283,6 +294,9 @@ static GF_Err HEVC_GetCapabilities(GF_BaseDecoder *ifcg, GF_CodecCapability *cap
 		break;
 	case GF_CODEC_OUTPUT_SIZE:
 		capability->cap.valueInt = ctx->out_size;
+		if (ctx->pack_mode) {
+			capability->cap.valueInt *= 4;
+		}
 		break;
 	case GF_CODEC_PIXEL_FORMAT:
 		capability->cap.valueInt = (ctx->luma_bpp==10) ? GF_PIXEL_YV12_10 : GF_PIXEL_YV12;
@@ -354,8 +368,10 @@ static GF_Err HEVC_flush_picture(HEVCDec *ctx, char *outBuffer, u32 *outBufferLe
 	unsigned int a_w, a_h, a_stride, bit_depth;
 	OpenHevc_Frame_cpy openHevcFrame;
 
-	libOpenHevcGetPictureInfo(ctx->openHevcHandle, &openHevcFrame.frameInfo);
-
+	if (ctx->direct_output)
+        libOpenHevcGetPictureInfo(ctx->openHevcHandle, &openHevcFrame.frameInfo);
+    else
+        libOpenHevcGetPictureInfoCpy(ctx->openHevcHandle, &openHevcFrame.frameInfo);
 
 	a_w      = openHevcFrame.frameInfo.nWidth;
 	a_h      = openHevcFrame.frameInfo.nHeight;
@@ -365,12 +381,15 @@ static GF_Err HEVC_flush_picture(HEVCDec *ctx, char *outBuffer, u32 *outBufferLe
 	*CTS = (u32) openHevcFrame.frameInfo.nTimeStamp;
 
 	if (!ctx->output_as_8bit) {
-		if ((ctx->luma_bpp>8) || (ctx->chroma_bpp>8)) a_stride *= 2;
+		if ((ctx->luma_bpp>8) || (ctx->chroma_bpp>8)) {
+			a_stride *= 2;
+			ctx->pack_mode = 0;
+		}
 	} else {
 		if (bit_depth>8) {
 			bit_depth=8;
-
 			ctx->conv_to_8bit = 1;
+			ctx->pack_mode = 0;
 		}
 	}
 
@@ -409,6 +428,49 @@ static GF_Err HEVC_flush_picture(HEVCDec *ctx, char *outBuffer, u32 *outBufferLe
 
 				if (ctx->direct_output )
 					ctx->has_pic = GF_TRUE;
+			}
+		} else if (ctx->pack_mode) {
+			OpenHevc_Frame openHFrame;
+			u8 *pY, *pU, *pV;
+
+			u32 idx_w, idx_h;
+			idx_w = ((ctx->frame_idx==0) || (ctx->frame_idx==2)) ? 0 : ctx->width;
+			idx_h = ((ctx->frame_idx==0) || (ctx->frame_idx==1)) ? 0 : ctx->height*2*ctx->stride;
+
+			pY = (void*) ( outBuffer + idx_h + idx_w );
+			pU = (void*) (outBuffer + 2*ctx->stride*2*ctx->height + idx_w/2 +  idx_h/4);
+			pV = (void*) (outBuffer + 2*ctx->stride*2*ctx->height + ctx->stride*ctx->height + idx_w/2 + idx_h/4);
+
+
+			*outBufferLength = 0;
+			if (libOpenHevcGetOutput(ctx->openHevcHandle, 1, &openHFrame)) {
+				u32 i, s_stride, qs_stride, d_stride, dd_stride, hd_stride;
+
+				s_stride = openHFrame.frameInfo.nYPitch;
+				qs_stride = s_stride / 4;
+
+				d_stride = ctx->stride;
+				dd_stride = 2*ctx->stride;
+				hd_stride = ctx->stride/2;
+
+				for (i=0; i<ctx->height; i++) {
+					memcpy(pY,  (u8 *) openHFrame.pvY + i*s_stride, d_stride);
+					pY += dd_stride;
+
+					if (! (i%2) ) {
+						memcpy(pU,  (u8 *) openHFrame.pvU + i*qs_stride, hd_stride);
+						pU += d_stride;
+
+						memcpy(pV,  (u8 *) openHFrame.pvV + i*qs_stride, hd_stride);
+						pV += d_stride;
+					}
+				}
+
+				ctx->frame_idx++;
+				if (ctx->frame_idx==4) {
+					*outBufferLength = 4 * ctx->out_size;
+					ctx->frame_idx = 0;
+				} 				
 			}
 		} else {
 			openHevcFrame.pvY = (void*) outBuffer;
